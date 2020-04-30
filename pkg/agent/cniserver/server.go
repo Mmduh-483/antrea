@@ -114,6 +114,7 @@ type NetworkConfig struct {
 	CNIVersion string          `json:"cniVersion,omitempty"`
 	Name       string          `json:"name,omitempty"`
 	Type       string          `json:"type,omitempty"`
+	DeviceID   string          `json:"deviceID"` // PCI address of a VF
 	MTU        int             `json:"mtu,omitempty"`
 	DNS        cnitypes.DNS    `json:"dns"`
 	IPAM       ipam.IPAMConfig `json:"ipam,omitempty"`
@@ -407,6 +408,7 @@ func (s *CNIServer) CmdAdd(ctx context.Context, request *cnipb.CniCmdRequest) (*
 		netNS,
 		cniConfig.Ifname,
 		cniConfig.MTU,
+		cniConfig.DeviceID,
 		result,
 	); err != nil {
 		klog.Errorf("Failed to configure interfaces for container %s: %v", cniConfig.ContainerId, err)

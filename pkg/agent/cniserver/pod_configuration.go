@@ -20,6 +20,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/Mellanox/sriovnet"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/cni/pkg/version"
@@ -69,6 +70,39 @@ type podConfigurator struct {
 	ovsDatapathType string
 }
 
+func renameLink(curName, newName string) error {
+	link, err := netlink.LinkByName(curName)
+	if err != nil {
+		return err
+	}
+
+	if err := netlink.LinkSetDown(link); err != nil {
+		return err
+	}
+	if err := netlink.LinkSetName(link, newName); err != nil {
+		return err
+	}
+	if err := netlink.LinkSetUp(link); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func moveIfToNetns(ifname string, netns ns.NetNS) error {
+	vfDev, err := netlink.LinkByName(ifname)
+	if err != nil {
+		return fmt.Errorf("failed to lookup vf device %v: %q", ifname, err)
+	}
+
+	// move VF device to ns
+	if err = netlink.LinkSetNsFd(vfDev, int(netns.Fd())); err != nil {
+		return fmt.Errorf("failed to move device %+v to netns: %q", ifname, err)
+	}
+
+	return nil
+}
+
 func newPodConfigurator(
 	ovsBridgeClient ovsconfig.OVSBridgeClient,
 	ofClient openflow.Client,
@@ -108,6 +142,93 @@ func (pc *podConfigurator) setupInterfaces(
 				return fmt.Errorf("error when disabling TX checksum offload on container veth: %v", err)
 			}
 		}
+		return nil
+	}); err != nil {
+		return nil, nil, err
+	}
+
+	return hostIface, containerIface, nil
+}
+
+// setupSriovInterfaces move VF to the container namesapce
+func (pc *podConfigurator) setupSriovInterfaces(
+	podName, podNamespace, ifname string,
+	netns ns.NetNS, mtu int,
+	pciAddrs string) (hostIface *current.Interface, containerIface *current.Interface, err error) {
+	hostRepPortName := util.GenerateContainerInterfaceName(podName, podNamespace)
+	hostIface = &current.Interface{}
+	containerIface = &current.Interface{}
+
+	// 1. get VF netdevice from PCI
+	vfNetDevices, err := sriovnet.GetNetDevicesFromPci(pciAddrs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Make sure we have 1 netdevice per pci address
+	if len(vfNetDevices) != 1 {
+		return nil, nil, fmt.Errorf("failed to get one netdevice interface per %s", pciAddrs)
+	}
+	vfNetDevice := vfNetDevices[0]
+
+	// 2. get Uplink netdevice
+	uplink, err := sriovnet.GetUplinkRepresentor(pciAddrs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 3. get VF index from PCI
+	vfIndex, err := sriovnet.GetVfIndexByPciAddress(pciAddrs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 4. lookup representor
+	repPortName, err := sriovnet.GetVfRepresentor(uplink, vfIndex)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 5. rename VF representor to hostRepPortName
+	if err = renameLink(repPortName, hostRepPortName); err != nil {
+		return nil, nil, fmt.Errorf("failed to rename %s to %s: %v", repPortName, hostRepPortName, err)
+	}
+
+	hostIface.Name = hostRepPortName
+	link, err := netlink.LinkByName(hostIface.Name)
+	if err != nil {
+		return nil, nil, err
+	}
+	hostIface.Mac = link.Attrs().HardwareAddr.String()
+
+	// 6. Move VF to Container namespace
+	err = moveIfToNetns(vfNetDevice, netns)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := netns.Do(func(hostNS ns.NetNS) error {
+		err = renameLink(vfNetDevice, ifname)
+		if err != nil {
+			return err
+		}
+		link, err = netlink.LinkByName(ifname)
+		if err != nil {
+			return err
+		}
+		err = netlink.LinkSetMTU(link, mtu)
+		if err != nil {
+			return err
+		}
+		err = netlink.LinkSetUp(link)
+		if err != nil {
+			return err
+		}
+
+		klog.V(2).Infof("Setup interfaces host: %s, container %s", repPortName, ifname)
+		containerIface.Name = ifname
+		containerIface.Mac = link.Attrs().HardwareAddr.String()
+		containerIface.Sandbox = netns.Path()
 		return nil
 	}); err != nil {
 		return nil, nil, err
@@ -338,6 +459,7 @@ func (pc *podConfigurator) configureInterfaces(
 	containerNetNS string,
 	containerIFDev string,
 	mtu int,
+	deviceId string,
 	result *current.Result,
 ) error {
 	netns, err := ns.GetNS(containerNetNS)
@@ -345,11 +467,21 @@ func (pc *podConfigurator) configureInterfaces(
 		return fmt.Errorf("failed to open netns %s: %v", containerNetNS, err)
 	}
 	defer netns.Close()
-	// Create veth pair and link up
-	hostIface, containerIface, err := pc.setupInterfaces(podName, podNameSpace, containerIFDev, netns, mtu)
-	if err != nil {
-		return fmt.Errorf("failed to create veth devices for container %s: %v", containerID, err)
+	var hostIface, containerIface *current.Interface
+	if deviceId != "" {
+		// SR-IOV VF
+		hostIface, containerIface, err = pc.setupSriovInterfaces(podName, podNameSpace, containerIFDev, netns, mtu, deviceId)
+		if err != nil {
+			return fmt.Errorf("failed to setup VF %s in container namespace %s: %v", deviceId, containerID, err)
+		}
+	} else {
+		// Create veth pair and link up
+		hostIface, containerIface, err = pc.setupInterfaces(podName, podNameSpace, containerIFDev, netns, mtu)
+		if err != nil {
+			return fmt.Errorf("failed to create veth devices for container %s: %v", containerID, err)
+		}
 	}
+
 	// Delete veth pair if any failure occurs in later manipulation.
 	success := false
 	defer func() {
